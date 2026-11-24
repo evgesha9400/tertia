@@ -4,6 +4,7 @@ import SwiftUI
 import TertiaCLI
 import TertiaCore
 import TertiaUI
+import UserNotifications
 import WidgetKit
 
 @MainActor
@@ -13,6 +14,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
     private let selfTestDirectory: URL?
     let model: ScheduleViewModel
     private var standaloneWindow: NSWindow?
+    private var notificationDelegate: ReminderNotificationDelegate?
+    private var stateChangeObserver: NSObjectProtocol?
 
     override init() {
         if CommandLine.arguments.contains("--self-test-mainactor") {
@@ -22,7 +25,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
             model = ScheduleViewModel(store: store, keychain: KeychainStore(service: "club.tertia.macos.selftest.\(UUID().uuidString)"))
         } else {
             selfTestDirectory = nil
-            model = ScheduleViewModel(onStateChanged: { WidgetCenter.shared.reloadAllTimelines() })
+            model = ScheduleViewModel(
+                reminderScheduler: UserNotificationReminderScheduler.live,
+                onStateChanged: { WidgetCenter.shared.reloadAllTimelines() }
+            )
         }
         super.init()
     }
@@ -39,6 +45,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
             }
             return
         }
+        if UserNotificationReminderScheduler.isAppBundle {
+            let delegate = ReminderNotificationDelegate { [weak self] clubId, date in
+                self?.model.openReminderTarget(clubId: clubId, date: date)
+                self?.openStandaloneWindow()
+            }
+            notificationDelegate = delegate
+            UNUserNotificationCenter.current().delegate = delegate
+        }
+        stateChangeObserver = DistributedNotificationCenter.default().addObserver(
+            forName: Notification.Name(SharedStateStore.stateChangedNotification),
+            object: nil, queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                self?.model.syncFromDisk()
+                await self?.model.reconcileReminders(requestPermission: false)
+            }
+        }
+        Task { @MainActor in await model.reconcileReminders(requestPermission: false) }
         if CommandLine.arguments.contains("--window") { DispatchQueue.main.async { self.openStandaloneWindow() } }
     }
 
@@ -87,7 +111,7 @@ enum TertiaEntrypoint {
             Task { @MainActor in Foundation.exit(await renderPreviews(args: Array(rawArgs.dropFirst()))) }
             RunLoop.main.run()
         } else if argv0 == "tertia" || TertiaCLI.shouldHandle(firstArg: rawArgs.first) {
-            Task.detached { Foundation.exit(await TertiaCLI.run(args: rawArgs, onStateChanged: notifyCLIStateChanged)) }
+            Task.detached { Foundation.exit(await TertiaCLI.run(args: rawArgs, reminderScheduler: UserNotificationReminderScheduler.live, onStateChanged: notifyCLIStateChanged)) }
             dispatchMain()
         } else {
             if rawArgs.contains("--self-test-mainactor") { Darwin.alarm(5) }

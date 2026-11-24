@@ -56,7 +56,7 @@ swiftc "${COMMON_FLAGS[@]}" \
   -module-name TertiaApp \
   -I "$OUT" \
   -L "$OUT" -lTertiaCLI -lTertiaUI -lTertiaCore \
-  -framework SwiftUI -framework AppKit -framework WidgetKit -framework Security \
+  -framework SwiftUI -framework AppKit -framework WidgetKit -framework Security -framework UserNotifications \
   -o "$OUT/TertiaApp" \
   "$ROOT"/Sources/TertiaApp/*.swift
 

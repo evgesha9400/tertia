@@ -193,6 +193,19 @@ public enum MCPServer {
             "class_id": Arg(type: "integer", description: "Booked class ID"),
             "late_booking": Arg(type: "boolean", description: "Acknowledge 3-hour late-cancel window"),
         ], required: ["class_id"]),
+        Tool(name: "list_reminders", description: "List active local macOS class reminders (works both signed out and signed in)."),
+        Tool(name: "set_reminder", description: "Schedule a local macOS Notification Center reminder before a class starts (5m to 48h). Works signed out and signed in.", args: [
+            "class_id": Arg(type: "integer", description: "Class ID from get_timetable"),
+            "hours": Arg(type: "integer", description: "Hours before class start (0 to 48)"),
+            "minutes": Arg(type: "integer", description: "Minutes before class start (5 to 2880 total; 0 to 59 when combined with hours)"),
+            "club_id": Arg(type: "integer", description: "Optional club ID when class_id appears in multiple cached clubs"),
+        ], required: ["class_id"]),
+        Tool(name: "remove_reminder", description: "Remove scheduled reminder(s) for a class ID (pass hours/minutes to target one lead time, or omit both to clear all).", args: [
+            "class_id": Arg(type: "integer", description: "Class ID"),
+            "hours": Arg(type: "integer", description: "Optional hours of a specific lead time to remove"),
+            "minutes": Arg(type: "integer", description: "Optional minutes of a specific lead time to remove"),
+            "club_id": Arg(type: "integer", description: "Optional club ID scope"),
+        ], required: ["class_id"]),
     ]
 
     /// One stdin line (strict UTF-8), a line that is not valid UTF-8, a line longer than the cap (its bytes were
@@ -216,12 +229,12 @@ public enum MCPServer {
     private static let invalidUTF8Response = response(id: "null", error: (-32700, "Parse error: invalid UTF-8"))
 
     public static func run(store: SharedStateStore, keychain: KeychainStore = KeychainStore(), client: PublicTimetableClient, bookingClient: MobileBookingClient = MobileBookingClient(),
-                           onStateChanged: @Sendable () -> Void = {}, maxLineBytes: Int = 1_048_576) async {
+                           reminderScheduler: (any ReminderScheduler)? = nil, onStateChanged: @Sendable () -> Void = {}, maxLineBytes: Int = 1_048_576) async {
         while true {
             let out: String?
             switch readBoundedLine(maxLineBytes: maxLineBytes, nextByte: { let c = getchar(); return c == EOF ? nil : UInt8(truncatingIfNeeded: c) }) {
             case .eof: return
-            case .line(let line): out = await handleLine(line, store: store, keychain: keychain, client: client, bookingClient: bookingClient, onStateChanged: onStateChanged)
+            case .line(let line): out = await handleLine(line, store: store, keychain: keychain, client: client, bookingClient: bookingClient, reminderScheduler: reminderScheduler, onStateChanged: onStateChanged)
             case .invalidUTF8: out = invalidUTF8Response
             case .overflow: out = response(id: "null", error: (-32600, "Invalid Request: line exceeded maximum size"))
             }
@@ -229,7 +242,7 @@ public enum MCPServer {
         }
     }
 
-    public static func handleLine(_ rawLine: String, store: SharedStateStore, keychain: KeychainStore = KeychainStore(), client: PublicTimetableClient, bookingClient: MobileBookingClient = MobileBookingClient(), onStateChanged: @Sendable () -> Void = {}) async -> String? {
+    public static func handleLine(_ rawLine: String, store: SharedStateStore, keychain: KeychainStore = KeychainStore(), client: PublicTimetableClient, bookingClient: MobileBookingClient = MobileBookingClient(), reminderScheduler: (any ReminderScheduler)? = nil, onStateChanged: @Sendable () -> Void = {}) async -> String? {
         // Only RFC 8259 whitespace (space, tab, LF, CR) makes a blank line; the line is parsed untrimmed, so other
         // Unicode whitespace such as U+00A0 is a parse error.
         if rawLine.utf8.allSatisfy({ [0x20, 0x09, 0x0A, 0x0D].contains($0) }) { return nil }
@@ -277,7 +290,7 @@ public enum MCPServer {
             // Unknown tools and invalid arguments are protocol errors; `isError` results are reserved for tools that ran and failed.
             guard let tool = tools.first(where: { $0.name == name }) else { return response(id: id, error: (-32602, "Invalid params: unknown tool '\(name)'")) }
             if let problem = validationError(args, for: tool) { return response(id: id, error: (-32602, "Invalid params: \(problem)")) }
-            return response(id: id, result: await handleToolCall(name: name, args: args, store: store, keychain: keychain, client: client, bookingClient: bookingClient, onStateChanged: onStateChanged))
+            return response(id: id, result: await handleToolCall(name: name, args: args, store: store, keychain: keychain, client: client, bookingClient: bookingClient, reminderScheduler: reminderScheduler, onStateChanged: onStateChanged))
         default:
             return response(id: id, error: (-32601, "Method not found: \(method)"))
         }
@@ -311,7 +324,7 @@ public enum MCPServer {
         return tool.required.first { args[$0] == nil }.map { "Missing required argument '\($0)'." }
     }
 
-    private static func handleToolCall(name: String, args: [String: JSONValue], store: SharedStateStore, keychain: KeychainStore, client: PublicTimetableClient, bookingClient: MobileBookingClient, onStateChanged: @Sendable () -> Void) async -> JSONValue {
+    private static func handleToolCall(name: String, args: [String: JSONValue], store: SharedStateStore, keychain: KeychainStore, client: PublicTimetableClient, bookingClient: MobileBookingClient, reminderScheduler: (any ReminderScheduler)?, onStateChanged: @Sendable () -> Void) async -> JSONValue {
         do {
             switch name {
             case "list_clubs":
@@ -336,6 +349,28 @@ public enum MCPServer {
             case "my_bookings":
                 let result = try await TertiaCLI.memberBookings(refresh: args["refresh"]?.boolValue ?? false, store: store, keychain: keychain, bookingClient: bookingClient, onStateChanged: onStateChanged)
                 return toolText(encodePrettyJSON(result.snapshot), note: result.warning.map { "warning:\($0)" })
+
+            case "list_reminders":
+                return toolText(encodePrettyJSON(TertiaCLI.listReminders(store: store)))
+
+            case "set_reminder":
+                guard let classId = args["class_id"]?.intValue, classId > 0 else { return toolText("class_id must be a positive integer.", isError: true) }
+                let clubId = args["club_id"]?.intValue
+                if let clubId, clubId <= 0 { return toolText("club_id must be a positive integer.", isError: true) }
+                let lead = try ClassReminder.leadMinutes(hours: args["hours"]?.intValue, minutes: args["minutes"]?.intValue)
+                let res = try await TertiaCLI.setReminder(classId: classId, clubId: clubId, leadMinutes: lead, store: store, keychain: keychain,
+                                                          client: client, reminderScheduler: reminderScheduler, onStateChanged: onStateChanged)
+                return toolText(encodePrettyJSON(res.reminder), note: TertiaCLI.reminderSyncNote(res.syncStatus))
+
+            case "remove_reminder":
+                guard let classId = args["class_id"]?.intValue, classId > 0 else { return toolText("class_id must be a positive integer.", isError: true) }
+                let clubId = args["club_id"]?.intValue
+                if let clubId, clubId <= 0 { return toolText("club_id must be a positive integer.", isError: true) }
+                let h = args["hours"]?.intValue, m = args["minutes"]?.intValue
+                let lead: Int? = (h != nil || m != nil) ? try ClassReminder.leadMinutes(hours: h, minutes: m) : nil
+                let res = try await TertiaCLI.removeReminder(classId: classId, clubId: clubId, leadMinutes: lead, store: store,
+                                                             reminderScheduler: reminderScheduler, onStateChanged: onStateChanged)
+                return toolText("Removed \(res.removed) reminder(s) for class \(classId).", note: TertiaCLI.reminderSyncNote(res.syncStatus))
 
             default: // book_class, cancel_booking
                 guard let classId = args["class_id"]?.intValue, classId > 0 else { return toolText("class_id must be a positive integer.", isError: true) }

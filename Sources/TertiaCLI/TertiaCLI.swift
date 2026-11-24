@@ -40,7 +40,8 @@ public enum TertiaCLI {
     public static let version = "0.1.0"
     public static let subcommands: Set<String> = [
         "timetable", "clubs", "set-club", "login", "logout",
-        "bookings", "book", "cancel", "mcp", "help", "--help", "-h", "version", "--version", "-v",
+        "bookings", "book", "cancel", "reminders", "remind", "unremind",
+        "mcp", "help", "--help", "-h", "version", "--version", "-v",
     ]
 
     public static func shouldHandle(firstArg: String?) -> Bool {
@@ -207,7 +208,59 @@ public enum TertiaCLI {
         }
     }
 
-    public static func run(args: [String], store: SharedStateStore = SharedStateStore(), keychain: KeychainStore = KeychainStore(), client: PublicTimetableClient? = nil, bookingClient: MobileBookingClient = MobileBookingClient(), onStateChanged: @Sendable () -> Void = {}) async -> Int32 {
+    public static func listReminders(store: SharedStateStore, nowProvider: () -> Date = { Date() }) -> [ClassReminder] {
+        store.loadReminders(now: nowProvider())
+    }
+
+    /// Resolves `classId` from local cached timetables (fetching `clubId` or the active club's today page once if not cached),
+    /// validates the `5m..48h` lead time against exact London wall time, persists `reminders.json`, and reconciles notifications.
+    public static func setReminder(classId: Int, clubId: Int?, leadMinutes: Int, store: SharedStateStore, keychain: KeychainStore,
+                                   client: PublicTimetableClient, reminderScheduler: (any ReminderScheduler)? = nil,
+                                   onStateChanged: @Sendable () -> Void = {}, nowProvider: () -> Date = { Date() }) async throws -> (reminder: ClassReminder, added: Bool, syncStatus: ReminderSyncStatus?) {
+        guard classId > 0 else { throw CLIError.usage("Invalid class ID '\(classId)'.") }
+        if let clubId, clubId <= 0 { throw CLIError.usage("Invalid club ID '\(clubId)'.") }
+        let lead = try ClassReminder.validateLeadMinutes(leadMinutes)
+        let entitled: Set<Int>? = (try? keychain.readSession()).map { Set($0.entitledClubs(from: store.publicClubCatalog()).map(\.id)) }
+        let target: (session: ClassSession, clubId: Int, clubName: String)
+        do {
+            target = try store.lookupClassForReminder(classId: classId, clubId: clubId, entitledClubIds: entitled)
+        } catch ReminderError.classNotFound {
+            let fetchClub = clubId ?? store.loadPreferences().clubId
+            _ = try? await client.fetchSchedule(clubId: fetchClub, date: LondonCalendar.londonTodayIso(now: nowProvider()), forceRefresh: false)
+            target = try store.lookupClassForReminder(classId: classId, clubId: clubId, entitledClubIds: entitled)
+        }
+        let now = nowProvider()
+        let reminder = try ClassReminder.make(session: target.session, clubId: target.clubId, clubName: target.clubName, leadMinutes: lead, now: now)
+        let saved = try store.addReminder(reminder, now: now)
+        onStateChanged()
+        let syncStatus: ReminderSyncStatus? = if let reminderScheduler { await reminderScheduler.sync(reminders: saved.reminders, requestPermission: false, now: now) } else { nil }
+        return (reminder, saved.added, syncStatus)
+    }
+
+    public static func removeReminder(classId: Int, clubId: Int?, leadMinutes: Int?, store: SharedStateStore,
+                                      reminderScheduler: (any ReminderScheduler)? = nil, onStateChanged: @Sendable () -> Void = {},
+                                      nowProvider: () -> Date = { Date() }) async throws -> (removed: Int, syncStatus: ReminderSyncStatus?) {
+        guard classId > 0 else { throw CLIError.usage("Invalid class ID '\(classId)'.") }
+        if let clubId, clubId <= 0 { throw CLIError.usage("Invalid club ID '\(clubId)'.") }
+        if let leadMinutes { _ = try ClassReminder.validateLeadMinutes(leadMinutes) }
+        let now = nowProvider()
+        let outcome = try store.removeReminders(classId: classId, clubId: clubId, date: nil, leadMinutes: leadMinutes, now: now)
+        if outcome.removed > 0 { onStateChanged() }
+        let syncStatus: ReminderSyncStatus? = if let reminderScheduler { await reminderScheduler.sync(reminders: outcome.reminders, requestPermission: false, now: now) } else { nil }
+        return (outcome.removed, syncStatus)
+    }
+
+    public static func reminderSyncNote(_ status: ReminderSyncStatus?) -> String? {
+        switch status {
+        case .permissionPending: "Saved locally; open Tertia and toggle a reminder once to allow macOS Notifications."
+        case .permissionDenied: "Saved locally, but Notifications for Tertia are denied in System Settings."
+        default: nil
+        }
+    }
+
+    public static func run(args: [String], store: SharedStateStore = SharedStateStore(), keychain: KeychainStore = KeychainStore(),
+                           client: PublicTimetableClient? = nil, bookingClient: MobileBookingClient = MobileBookingClient(),
+                           reminderScheduler: (any ReminderScheduler)? = nil, onStateChanged: @Sendable () -> Void = {}) async -> Int32 {
         let cmd = args.first ?? "help"
         let rest = Array(args.dropFirst())
         let timetableClient = client ?? PublicTimetableClient(store: store)
@@ -235,9 +288,12 @@ public enum TertiaCLI {
                 let parsed = try parseOptions(rest, boolFlags: isCancel ? ["--late"] : [])
                 let classId = try singlePositiveInt(parsed, usage: "usage: tertia \(cmd) <class_id>\(isCancel ? " [--late]" : "")")
                 print(try await performMutation(classId: classId, isCancel: isCancel, late: parsed.flags.contains("--late"), store: store, keychain: keychain, client: timetableClient, bookingClient: bookingClient, onStateChanged: onStateChanged))
+            case "reminders": try runReminders(args: rest, store: store)
+            case "remind": try await runRemind(args: rest, store: store, keychain: keychain, client: timetableClient, reminderScheduler: reminderScheduler, onStateChanged: onStateChanged)
+            case "unremind": try await runUnremind(args: rest, store: store, reminderScheduler: reminderScheduler, onStateChanged: onStateChanged)
             case "mcp":
                 try requireNoPositionals(try parseOptions(rest), usage: "usage: tertia mcp")
-                await MCPServer.run(store: store, keychain: keychain, client: timetableClient, bookingClient: bookingClient, onStateChanged: onStateChanged)
+                await MCPServer.run(store: store, keychain: keychain, client: timetableClient, bookingClient: bookingClient, reminderScheduler: reminderScheduler, onStateChanged: onStateChanged)
             default:
                 writeStderr("error: unknown command '\(cmd)'\n\(usageText)")
                 return 1
@@ -393,6 +449,68 @@ public enum TertiaCLI {
         }
     }
 
+    private static func parseReminderClubAndLead(_ values: [String: String], requireLead: Bool, usage: String) throws -> (clubId: Int?, leadMinutes: Int?) {
+        let clubId = try values["--club"].map { raw -> Int in
+            guard let id = Int(raw), id > 0 else { throw CLIError.usage("Invalid club ID '\(raw)'.") }
+            return id
+        }
+        let before = values["--before"], hRaw = values["--hours"], mRaw = values["--minutes"]
+        guard before == nil || (hRaw == nil && mRaw == nil) else {
+            throw CLIError.usage("Use either --before or --hours/--minutes, not both.")
+        }
+        if let before { return (clubId, try ClassReminder.parseLeadMinutes(before)) }
+        if hRaw != nil || mRaw != nil {
+            func intOpt(_ key: String, _ raw: String?) throws -> Int? {
+                guard let raw else { return nil }
+                guard let val = Int(raw) else { throw CLIError.usage("Invalid value '\(raw)' for \(key).") }
+                return val
+            }
+            return (clubId, try ClassReminder.leadMinutes(hours: try intOpt("--hours", hRaw), minutes: try intOpt("--minutes", mRaw)))
+        }
+        if requireLead { throw CLIError.usage(usage) }
+        return (clubId, nil)
+    }
+
+    private static func runReminders(args: [String], store: SharedStateStore) throws {
+        let parsed = try parseOptions(args, boolFlags: ["--json"])
+        try requireNoPositionals(parsed, usage: "usage: tertia reminders [--json]")
+        let items = listReminders(store: store)
+        if parsed.flags.contains("--json") { print(encodePrettyJSON(items)); return }
+        print("TERTIA · REMINDERS (\(items.count) items)\n" + String(repeating: "-", count: 78))
+        if items.isEmpty { print("No active reminders."); return }
+        for item in items {
+            let lead = ClassReminder.formatLeadTime(minutes: item.leadMinutes).padding(toLength: 6, withPad: " ", startingAt: 0)
+            let fire = LondonCalendar.formatWeekdayTime(item.fireAt)
+            print("\(padLeft(item.classId, width: 7))  \(item.date) \(item.startTime)  \(lead)  \(fire)  \(item.title.padding(toLength: 24, withPad: " ", startingAt: 0))  (\(item.clubName))")
+        }
+    }
+
+    private static func runRemind(args: [String], store: SharedStateStore, keychain: KeychainStore, client: PublicTimetableClient,
+                                  reminderScheduler: (any ReminderScheduler)?, onStateChanged: @Sendable () -> Void) async throws {
+        let usage = "usage: tertia remind <class_id> (--before <5m..48h> | [--hours <0..48>] [--minutes <0..59>]) [--club <club_id>]"
+        let parsed = try parseOptions(args, valueFlags: ["--before", "--hours", "--minutes", "--club"])
+        let classId = try singlePositiveInt(parsed, usage: usage)
+        let (clubId, lead) = try parseReminderClubAndLead(parsed.values, requireLead: true, usage: usage)
+        let res = try await setReminder(classId: classId, clubId: clubId, leadMinutes: lead!, store: store, keychain: keychain,
+                                        client: client, reminderScheduler: reminderScheduler, onStateChanged: onStateChanged)
+        let r = res.reminder, label = ClassReminder.formatLeadTime(minutes: r.leadMinutes)
+        let statusWord = res.added ? "Reminder set" : "Reminder already set"
+        print("\(statusWord) for \(r.title) at \(r.clubName) (\(r.date) \(r.startTime)): \(label) before (alerts \(LondonCalendar.formatWeekdayTime(r.fireAt))).")
+        if let note = reminderSyncNote(res.syncStatus) { writeStderr("note: \(note)") }
+    }
+
+    private static func runUnremind(args: [String], store: SharedStateStore, reminderScheduler: (any ReminderScheduler)?,
+                                    onStateChanged: @Sendable () -> Void) async throws {
+        let usage = "usage: tertia unremind <class_id> [--before <5m..48h> | --hours <h> --minutes <m>] [--club <club_id>]"
+        let parsed = try parseOptions(args, valueFlags: ["--before", "--hours", "--minutes", "--club"])
+        let classId = try singlePositiveInt(parsed, usage: usage)
+        let (clubId, lead) = try parseReminderClubAndLead(parsed.values, requireLead: false, usage: usage)
+        let res = try await removeReminder(classId: classId, clubId: clubId, leadMinutes: lead, store: store,
+                                           reminderScheduler: reminderScheduler, onStateChanged: onStateChanged)
+        print("Removed \(res.removed) reminder(s) for class \(classId).")
+        if let note = reminderSyncNote(res.syncStatus) { writeStderr("note: \(note)") }
+    }
+
     public static let usageText = """
     tertia - Third Space timetable, booking CLI & MCP server
 
@@ -405,6 +523,9 @@ public enum TertiaCLI {
       tertia bookings [--refresh] [--json]
       tertia book <class_id>
       tertia cancel <class_id> [--late]
+      tertia reminders [--json]
+      tertia remind <class_id> (--before <5m..48h> | --hours <h> --minutes <m>) [--club <club_id>]
+      tertia unremind <class_id> [--before <5m..48h> | --hours <h> --minutes <m>] [--club <club_id>]
       tertia mcp
       tertia version
     """

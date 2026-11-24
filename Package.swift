@@ -41,6 +41,7 @@ let package = Package(
                 .linkedFramework("AppKit"),
                 .linkedFramework("WidgetKit"),
                 .linkedFramework("Security"),
+                .linkedFramework("UserNotifications"),
             ]
         ),
         .executableTarget(

@@ -306,6 +306,7 @@ public final class SharedStateStore: @unchecked Sendable {
     private static let folderName = "TertiaClub"
     private static let bookingsFile = "bookings.json", accountFile = "account.json", sequenceFile = "sequence.json"
     private static let preferencesFile = "preferences.json", publicClubsFile = "public-clubs.json"
+    private static let remindersFile = "reminders.json", remindersLock = ".reminders.lock"
 
     /// Widget mirror payload: active booked IDs, the opaque owner, and one-way row tokens (`widgetRowToken`) binding each
     /// badge to its club and London date (no titles, times, emails, or waitlist data). Legacy files have no `rowTokens`.
@@ -1089,6 +1090,115 @@ public final class SharedStateStore: @unchecked Sendable {
     private static func matchesSession(_ live: MemberSession?, _ expected: MemberSession) -> Bool {
         guard let live, let key = expected.ownerKey, !expected.token.isEmpty else { return false }
         return live.token == expected.token && live.ownerKey == key
+    }
+
+    // MARK: Reminders
+
+    private static func activeSortedReminders(_ list: [ClassReminder], now: Date) -> [ClassReminder] {
+        list.filter { $0.fireAt > now && (ClassReminder.minLeadMinutes...ClassReminder.maxLeadMinutes).contains($0.leadMinutes) }
+            .sorted { ($0.fireAt, $0.classStart, $0.clubId, $0.classId, $0.leadMinutes) < ($1.fireAt, $1.classStart, $1.clubId, $1.classId, $1.leadMinutes) }
+    }
+
+    /// Reads upcoming reminders from primary `reminders.json` (never mirrored to the widget); returns `[]` on lock timeout.
+    public func loadReminders(now: Date = Date()) -> [ClassReminder] {
+        (try? withFileLock(Self.remindersLock) {
+            Self.activeSortedReminders(read([ClassReminder].self, Self.remindersFile) ?? [], now: now)
+        }) ?? []
+    }
+
+    /// Adds a reminder under `.reminders.lock`, pruning expired entries and deduplicating by ID.
+    @discardableResult
+    public func addReminder(_ reminder: ClassReminder, now: Date = Date()) throws -> (reminders: [ClassReminder], added: Bool) {
+        _ = try ClassReminder.validateLeadMinutes(reminder.leadMinutes)
+        guard reminder.fireAt > now, reminder.classStart > now else {
+            throw ReminderError.reminderTimePassed("\(ClassReminder.formatLeadTime(minutes: reminder.leadMinutes)) before \(reminder.startTime)")
+        }
+        return try withFileLock(Self.remindersLock) {
+            let current = try readStrict([ClassReminder].self, Self.remindersFile) ?? []
+            var kept = Self.activeSortedReminders(current, now: now)
+            let exists = kept.contains { $0.id == reminder.id }
+            if !exists { kept.append(reminder) }
+            let sorted = Self.activeSortedReminders(kept, now: now)
+            try writeFile(sorted, Self.remindersFile, in: primaryDirectory)
+            return (sorted, !exists)
+        }
+    }
+
+    @discardableResult
+    public func removeReminder(id: String, now: Date = Date()) throws -> (reminders: [ClassReminder], removed: Int) {
+        try withFileLock(Self.remindersLock) {
+            let current = try readStrict([ClassReminder].self, Self.remindersFile) ?? []
+            let before = current.count
+            let remaining = current.filter { $0.id != id }
+            let removed = before - remaining.count
+            let sorted = Self.activeSortedReminders(remaining, now: now)
+            if removed > 0 || sorted.count != current.count { try writeFile(sorted, Self.remindersFile, in: primaryDirectory) }
+            return (sorted, removed)
+        }
+    }
+
+    @discardableResult
+    public func removeReminders(classId: Int, clubId: Int? = nil, date: String? = nil, leadMinutes: Int? = nil,
+                                now: Date = Date()) throws -> (reminders: [ClassReminder], removed: Int) {
+        try withFileLock(Self.remindersLock) {
+            let current = try readStrict([ClassReminder].self, Self.remindersFile) ?? []
+            let remaining = current.filter { item in
+                let matches = item.classId == classId
+                    && (clubId == nil || item.clubId == clubId)
+                    && (date == nil || item.date == date)
+                    && (leadMinutes == nil || item.leadMinutes == leadMinutes)
+                return !matches
+            }
+            let removed = current.count - remaining.count
+            let sorted = Self.activeSortedReminders(remaining, now: now)
+            if removed > 0 || sorted.count != current.count { try writeFile(sorted, Self.remindersFile, in: primaryDirectory) }
+            return (sorted, removed)
+        }
+    }
+
+    @discardableResult
+    public func pruneExpiredReminders(now: Date = Date()) throws -> [ClassReminder] {
+        try withFileLock(Self.remindersLock) {
+            let current = try readStrict([ClassReminder].self, Self.remindersFile) ?? []
+            let sorted = Self.activeSortedReminders(current, now: now)
+            if sorted.count != current.count { try writeFile(sorted, Self.remindersFile, in: primaryDirectory) }
+            return sorted
+        }
+    }
+
+    /// Resolves `classId` across cached timetables for reminder scheduling: an explicit `clubId` reads that club's public
+    /// snapshot directly (matching `tertia timetable --club`), while an omitted `clubId` searches entitled clubs when
+    /// signed in or all cached clubs when signed out.
+    public func lookupClassForReminder(classId: Int, clubId: Int?, entitledClubIds: Set<Int>?) throws -> (session: ClassSession, clubId: Int, clubName: String) {
+        try withFileLock(".timetables.lock") {
+            let catalogNames = Dictionary(publicClubCatalogUnlocked().map { ($0.id, $0.name) }, uniquingKeysWith: { first, _ in first })
+            func clubTitle(_ snap: TimetableSnapshot, _ id: Int, _ row: ClassSession) -> String {
+                if !snap.clubName.isEmpty { return snap.clubName }
+                return catalogNames[id] ?? row.clubName
+            }
+            if let clubId {
+                guard let snap = try readStrict(TimetableSnapshot.self, Self.snapshotFile(clubId)), snap.clubId == clubId else {
+                    throw ReminderError.classNotFound(classId)
+                }
+                switch snap.lookupSession(id: classId) {
+                case .unique(let row): return (row, clubId, clubTitle(snap, clubId, row))
+                case .ambiguous: throw ReminderError.ambiguousClass(classId)
+                case .missing: throw ReminderError.classNotFound(classId)
+                }
+            }
+            let snapshots = storedSnapshotsUnlocked().snapshots.filter { entitledClubIds == nil || entitledClubIds!.contains($0.clubId) }
+            var matches: [(ClassSession, Int, String)] = []
+            for snap in snapshots {
+                switch snap.lookupSession(id: classId) {
+                case .ambiguous: throw ReminderError.ambiguousClass(classId)
+                case .unique(let row): matches.append((row, snap.clubId, clubTitle(snap, snap.clubId, row)))
+                case .missing: continue
+                }
+            }
+            guard matches.count <= 1 else { throw ReminderError.ambiguousClass(classId) }
+            guard let match = matches.first else { throw ReminderError.classNotFound(classId) }
+            return match
+        }
     }
 
     // MARK: Plumbing (callers hold `lock`)

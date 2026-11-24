@@ -61,10 +61,10 @@ Add Small, Medium, or Large **Tertia Timetable** widgets directly to your macOS 
 
 | Surface | Read-Only Public Mode (Default) | Opt-In Signed-In Member Mode |
 |---|---|---|
-| **Menu-Bar App** (`Tertia.app`) | Instant 10-day timetable across 17 London clubs, AM/PM/Eve period filter, class & coach search, dark/light theme | Scopes clubs to your signed-in account, plus inline `BOOK` and `BOOKED · CANCEL` buttons on `48H OPEN` classes and 3-hour late-cancel guard |
+| **Menu-Bar App** (`Tertia.app`) | Instant 10-day timetable across 17 London clubs, AM/PM/Eve period filter, class & coach search, dark/light theme, local macOS notifications (`5m` to `48h` before start) | Scopes clubs to your signed-in account, plus inline `BOOK` and `BOOKED · CANCEL` buttons on `48H OPEN` classes, 3-hour late-cancel guard, and local class reminders |
 | **Desktop Widget** (`TertiaWidget.appex`) | Small, Medium, and Large macOS `WidgetKit` widgets synced from `thirdspace.london/timetable/` | Highlights active bookings with a `BOOKED` badge (the widget container receives no private booking details: no tokens, booked class titles, trainer names, booking timestamps, or member emails; only active `bookedIds`, one-way SHA-256 row tokens binding each to its club and London date, an opaque account hash, preferences, and public timetables) |
-| **CLI** (`tertia`) | `clubs`, `timetable` (table or `--json`), `set-club` | `login`, `logout`, `bookings`, `book`, `cancel` |
-| **MCP Server** (`tertia mcp`) | `list_clubs`, `get_timetable`, `set_widget_club` | `my_bookings`, `book_class`, `cancel_booking` |
+| **CLI** (`tertia`) | `clubs`, `timetable` (table or `--json`), `set-club`, `reminders`, `remind`, `unremind` | `login`, `logout`, `bookings`, `book`, `cancel`, `reminders`, `remind`, `unremind` |
+| **MCP Server** (`tertia mcp`) | `list_clubs`, `get_timetable`, `set_widget_club`, `list_reminders`, `set_reminder`, `remove_reminder` | `my_bookings`, `book_class`, `cancel_booking`, `list_reminders`, `set_reminder`, `remove_reminder` |
 
 ---
 
@@ -122,6 +122,12 @@ tertia timetable --club 52 --date 2026-11-22 --period evening --search Reformer 
 
 # Switch the club displayed on your Desktop Widget and menu-bar app
 tertia set-club 201
+
+# Schedule, list, and remove local macOS Notification Center class reminders (5m to 48h before start)
+tertia remind 3064910 --before 30m
+tertia remind 3064910 --hours 1 --minutes 30 --club 39
+tertia reminders --json
+tertia unremind 3064910
 ```
 
 ### 2. Sign In, Book, and Cancel Available (`48H OPEN`) Classes
@@ -152,9 +158,9 @@ tertia logout
 
 ## MCP Server Integration (Claude Desktop, Cursor, Antigravity)
 
-Tertia ships a native stdio **Model Context Protocol (MCP)** server (`tertia mcp`) inside the same app bundle. It exposes 6 structured tools:
+Tertia ships a native stdio **Model Context Protocol (MCP)** server (`tertia mcp`) inside the same app bundle. It exposes 9 structured tools:
 
-- **Public tools:** `list_clubs`, `get_timetable`, `set_widget_club`
+- **Public tools (work signed out and signed in):** `list_clubs`, `get_timetable`, `set_widget_club`, `list_reminders`, `set_reminder`, `remove_reminder`
 - **Member tools (uses Keychain session from `tertia login` or UI Sign In):** `my_bookings`, `book_class`, `cancel_booking`
 
 Add this block to your MCP client configuration (for example `~/Library/Application Support/Claude/claude_desktop_config.json`, Cursor MCP settings, or Antigravity `mcp_config.json`):
@@ -179,8 +185,8 @@ Example prompts you can ask your AI assistant once configured:
 
 ## Privacy, Sync Rules & Security Model
 
-1. **Three-Trigger Private Sync Policy:**
-   The timetable itself always loads from the public website (`https://www.thirdspace.london/timetable/`). When you sign in, private mobile API calls (`https://api.thirdspace-london.app`) happen **only** at three explicit moments:
+1. **Three-Trigger Private Sync Policy & Offline Reminders:**
+   The timetable itself always loads from the public website (`https://www.thirdspace.london/timetable/`). Local macOS class reminders (`5m` to `48h` before start) are saved in `reminders.json` inside `~/Library/Application Support/TertiaClub`, scheduled locally with `UNUserNotificationCenter`, preserved across sign-in/sign-out, and trigger zero background network requests. When you sign in, private mobile API calls (`https://api.thirdspace-london.app`) happen **only** at three explicit moments:
    - Once when you sign in,
    - When you click **Refresh** in the menu bar (or run `tertia bookings --refresh`),
    - Immediately after you book or cancel a class.
@@ -223,20 +229,23 @@ Built for Apple Silicon (`arm64-apple-macosx14.0`). `TertiaCore` and `TertiaCLI`
 Sources/
   TertiaCore/
     Models.swift                # Clubs, ClassSession, LondonCalendar (48h open & 3h late windows), booking models
+    Reminders.swift             # Reminder lead-time validation (5m to 48h), formatting, and notification scheduler contract
     HTMLTimetableParser.swift   # Extracts public schedule JSON from thirdspace.london/timetable/
     PublicTimetableClient.swift # 30-minute cached unauthenticated schedule fetcher
     MobileBookingClient.swift   # Mobile 6.7.4 authenticated client (login, bookings, book, cancel)
-    SharedStateStore.swift      # Non-interactive KeychainStore + atomic JSON mirror to Widget container
+    SharedStateStore.swift      # Non-interactive KeychainStore, local reminders store, atomic mirror to Widget container
   TertiaCLI/
-    TertiaCLI.swift             # UI-free CLI library (clubs, timetable, set-club, login, logout, bookings, book, cancel, mcp)
+    TertiaCLI.swift             # UI-free CLI library (clubs, timetable, set-club, login, logout, bookings, book, cancel, reminders, remind, unremind, mcp)
     MCPServer.swift             # Native stdio JSON-RPC MCP server (zero AppKit/SwiftUI/WidgetKit dependencies)
   TertiaUI/
     TertiaTheme.swift           # Dark obsidian (#0A0A0A) & ivory light (#FAFAF8) design tokens
     TertiaBrandMark.swift       # Bold vector trefoil mark (fill + stroke) and monochrome wordmark
-    CompactClassCard.swift      # Compact 2-row class card + interactive BOOK / BOOKED / LATE CONFIRM chips
+    CompactClassCard.swift      # Compact 2-row class card + reminder bell toggle + BOOK / BOOKED / LATE CONFIRM chips
+    ReminderViews.swift         # Inline preset + custom H/M reminder drawer and reminders overview panel
     MenuBarScheduleView.swift   # Menu-bar popover, Keychain sign-in panel, club picker, static preview mode
     WidgetViews.swift           # Small, Medium, and Large WidgetKit views sharing WidgetListShell
   TertiaApp/
+    ReminderNotifications.swift # UNUserNotificationCenter reconciliation and click-to-focus notification delegate
     TertiaMainApp.swift         # Unified app & CLI binary (LSUIElement menu bar + tertia:// window + Helpers/tertia symlink)
   TertiaWidget/
     TertiaWidgetBundle.swift    # WidgetKit StaticConfiguration extension (TertiaWidget.appex)

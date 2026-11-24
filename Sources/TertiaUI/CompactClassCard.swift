@@ -50,12 +50,18 @@ public struct CompactClassCard: View {
     public let palette: TertiaPalette
     public let now: Date
     public let dense, isBooked, isBusy, confirmingLateCancel, canCancelBooked: Bool
+    public let activeReminderLabels: [String]
+    public let isReminderPickerOpen: Bool
+    public let onToggleReminderPicker: (() -> Void)?
     public let onAction: (() -> Void)?
 
-    public init(session: ClassSession, palette: TertiaPalette, now: Date = Date(), dense: Bool = false, isBooked: Bool = false, isBusy: Bool = false, confirmingLateCancel: Bool = false, canCancelBooked: Bool = true, onAction: (() -> Void)? = nil) {
+    public init(session: ClassSession, palette: TertiaPalette, now: Date = Date(), dense: Bool = false, isBooked: Bool = false, isBusy: Bool = false,
+                confirmingLateCancel: Bool = false, canCancelBooked: Bool = true, activeReminderLabels: [String] = [], isReminderPickerOpen: Bool = false,
+                onToggleReminderPicker: (() -> Void)? = nil, onAction: (() -> Void)? = nil) {
         self.session = session; self.palette = palette; self.now = now; self.dense = dense
         self.isBooked = isBooked; self.isBusy = isBusy; self.confirmingLateCancel = confirmingLateCancel
-        self.canCancelBooked = canCancelBooked; self.onAction = onAction
+        self.canCancelBooked = canCancelBooked; self.activeReminderLabels = activeReminderLabels
+        self.isReminderPickerOpen = isReminderPickerOpen; self.onToggleReminderPicker = onToggleReminderPicker; self.onAction = onAction
     }
 
     public var body: some View {
@@ -66,15 +72,43 @@ public struct CompactClassCard: View {
                 Spacer(minLength: 6)
                 Text("\(session.startTime) - \(session.endTime)").font(.system(size: dense ? 10.5 : 11, weight: .medium, design: .monospaced)).monospacedDigit().foregroundStyle(palette.ink)
             }
-            HStack(alignment: .center, spacing: 8) {
+            HStack(alignment: .center, spacing: 6) {
                 Text(session.trainer.isEmpty ? "Instructor TBA" : session.trainer).font(.system(size: dense ? 10.5 : 11)).foregroundStyle(palette.muted).lineLimit(1)
                 Spacer(minLength: 6)
-                trailingBadge(status: status)
-                Text("\(session.durationMinutes)m").font(.system(size: 10, design: .monospaced)).monospacedDigit().foregroundStyle(palette.faint)
+                if !dense, let onToggleReminderPicker {
+                    reminderBellButton(action: onToggleReminderPicker).fixedSize(horizontal: true, vertical: false)
+                }
+                trailingBadge(status: status).fixedSize(horizontal: true, vertical: false)
+                Text("\(session.durationMinutes)m").font(.system(size: 10, design: .monospaced)).monospacedDigit().foregroundStyle(palette.faint).fixedSize(horizontal: true, vertical: false)
             }
         }
         .padding(.horizontal, dense ? 9 : 11).padding(.vertical, dense ? 6 : 8)
         .tertiaSurface(fill: palette.card, border: isBooked ? palette.openStatus.opacity(0.42) : palette.border, radius: TertiaMetrics.cardRadius)
+    }
+
+    @ViewBuilder
+    private func reminderBellButton(action: @escaping () -> Void) -> some View {
+        let hasActive = !activeReminderLabels.isEmpty
+        let compactLabel = activeReminderLabels.first.map { first in
+            activeReminderLabels.count > 1 ? "\(first)+\(activeReminderLabels.count - 1)" : first
+        }
+        Button(action: action) {
+            HStack(spacing: 3) {
+                Image(systemName: hasActive || isReminderPickerOpen ? "bell.fill" : "bell").font(.system(size: 9, weight: .semibold))
+                if let compactLabel {
+                    Text(compactLabel).font(.system(size: 8.5, weight: .semibold, design: .monospaced)).lineLimit(1)
+                }
+            }
+            .foregroundStyle(hasActive ? palette.warningStatus : (isReminderPickerOpen ? palette.ink : palette.faint))
+            .padding(.horizontal, hasActive ? 6 : 5).frame(height: 19)
+            .tertiaSurface(
+                fill: hasActive ? palette.warningStatus.opacity(0.14) : (isReminderPickerOpen ? palette.pillSurface : .clear),
+                border: hasActive ? palette.warningStatus.opacity(isReminderPickerOpen ? 0.65 : 0.35) : (isReminderPickerOpen ? palette.border : .clear),
+                radius: 9.5
+            )
+            .contentShape(Capsule())
+        }
+        .buttonStyle(.plain).help("Set class reminder")
     }
 
     @ViewBuilder

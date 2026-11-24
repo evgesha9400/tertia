@@ -766,6 +766,7 @@ struct VerifyCoreTests {
             ("loop8", loop8),
             ("loop9", loop9),
             ("loop10", loop10),
+            ("remindersSuite", remindersSuite),
         ]
         for (name, suite) in suites {
             let began = Date()
@@ -1379,7 +1380,9 @@ struct VerifyCoreTests {
     try assertTrue((notifWithId["error"] as? [String: Any])?["code"] as? Int == -32601 && notifWithId["id"] as? Int == 5, "notification method sent with an id still gets a response")
 
     let tools = (try decodeJSON(await mcp("{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/list\"}"))["result"] as? [String: Any])?["tools"] as? [[String: Any]] ?? []
-    try assertEqual(tools.compactMap { $0["name"] as? String }, ["list_clubs", "get_timetable", "set_widget_club", "my_bookings", "book_class", "cancel_booking"], "tools/list exposes 6 tools")
+    try assertEqual(tools.compactMap { $0["name"] as? String },
+                    ["list_clubs", "get_timetable", "set_widget_club", "my_bookings", "book_class", "cancel_booking", "list_reminders", "set_reminder", "remove_reminder"],
+                    "tools/list exposes 9 tools")
     let clubProp = ((tools[1]["inputSchema"] as? [String: Any])?["properties"] as? [String: Any])?["club_id"] as? [String: Any]
     try assertEqual(clubProp?["description"] as? String, "Club ID (defaults to active widget club preference)", "get_timetable club_id description")
     let scoped = try JSONDecoder().decode([Club].self, from: Data(try toolResult(await call("list_clubs")).text.utf8))
@@ -5856,5 +5859,167 @@ func loopbackConnect(_ port: Int) -> Int32 {
         let queried = try await TertiaCLI.queryTimetable(clubId: 39, date: todayIso, period: nil, search: nil, refresh: true, store: cliStore, client: mockPublicClient(store: cliStore), nowProvider: { @Sendable in at1000 })
         MockHTTPBox.shared.set(39, body: page39)
         try assertEqual(queried.classes.map(\.id), [992], "CLI explicit --date today also drops started classes at start time")
+    }
+}
+
+/// Reminders: lead-time validation (5m..48h presets & H/M custom), DST/past rejections, persistence across auth state,
+/// signed-out and signed-in ScheduleViewModel flows, CLI (`remind`/`reminders`/`unremind`), and MCP reminder tools.
+@MainActor func remindersSuite(_ ctx: TestContext) async throws {
+    let clock: @Sendable (String, String) -> Date = { day, hhmm in LondonCalendar.londonWallDate(dateIso: day, hhmm: hhmm)! }
+    final class MockReminderScheduler: ReminderScheduler, @unchecked Sendable {
+        let calls = Locked<[(count: Int, ids: [String], requested: Bool)]>([])
+        let status = Locked<ReminderSyncStatus>(.scheduled)
+        func sync(reminders: [ClassReminder], requestPermission: Bool, now: Date) async -> ReminderSyncStatus {
+            let activeIds = reminders.filter { $0.fireAt > now }.map(\.id)
+            calls.mutate { $0.append((activeIds.count, activeIds, requestPermission)) }
+            return status.value
+        }
+    }
+
+    // 1. Validation & formatting (5m..48h, hours + minutes, string duration parser)
+    try assertEqual(ClassReminder.presetLeadMinutes, [5, 15, 30, 60, 180, 1440, 2880], "preset lead times cover 5m through 48h")
+    try assertEqual(ClassReminder.formatLeadTime(minutes: 5), "5m", "format 5m")
+    try assertEqual(ClassReminder.formatLeadTime(minutes: 90), "1h 30m", "format 1h 30m")
+    try assertEqual(ClassReminder.formatLeadTime(minutes: 2880), "48h", "format 48h")
+    for (raw, expected) in [("5m", 5), ("30m", 30), ("90m", 90), ("1h", 60), ("1h30m", 90), ("1h 30m", 90), ("48h", 2880), ("48h0m", 2880), ("2H 15M", 135)] {
+        try assertEqual(try ClassReminder.parseLeadMinutes(raw), expected, "parseLeadMinutes('\(raw)') == \(expected)")
+    }
+    for bad in ["", "0m", "4m", "-5m", "48h1m", "49h", "30", "1h60m", "999999999999999999999h", "1h 2h", "abc"] {
+        try await assertThrows("parseLeadMinutes rejects '\(bad)'") { _ = try ClassReminder.parseLeadMinutes(bad) }
+    }
+    try assertEqual(try ClassReminder.leadMinutes(hours: 47, minutes: 55), 2875, "custom 47h 55m valid")
+    try assertEqual(try ClassReminder.leadMinutes(hours: nil, minutes: 120), 120, "minutes-only custom lead valid up to 2880")
+    try await assertThrows("hours+minutes rejects minutes >= 60") { _ = try ClassReminder.leadMinutes(hours: 1, minutes: 60) }
+    try await assertThrows("leadMinutes rejects > 48h") { _ = try ClassReminder.leadMinutes(hours: 48, minutes: 5) }
+    try await assertThrows("leadMinutes rejects 4m") { _ = try ClassReminder.leadMinutes(hours: 0, minutes: 4) }
+
+    // 2. DST ambiguous/invalid & past-time rejections + notification copy
+    let nowRef = clock(todayIso, "10:00")
+    let pastSession = row(9101, todayIso, "09:30", "Early Yoga")
+    let soonSession = row(9102, todayIso, "10:20", "Quick Core")
+    let laterSession = row(9103, todayIso, "16:00", "Afternoon Reformer")
+    let springGap = row(9104, "2026-03-29", "01:30", "Gap Class")
+    let autumnDup = row(9105, "2026-10-25", "01:30", "Autumn Class")
+    for invalid in [springGap, autumnDup] {
+        try await assertThrows("DST clock-change start rejected for \(invalid.date)") {
+            _ = try ClassReminder.make(session: invalid, clubId: 39, clubName: "Canary Wharf", leadMinutes: 30, now: LondonCalendar.parseIsoDate("2026-03-01")!)
+        }
+    }
+    try await assertThrows("started class rejected") { _ = try ClassReminder.make(session: pastSession, clubId: 39, clubName: "Canary Wharf", leadMinutes: 5, now: nowRef) }
+    try await assertThrows("30m reminder for class starting in 20m is in the past") { _ = try ClassReminder.make(session: soonSession, clubId: 39, clubName: "Canary Wharf", leadMinutes: 30, now: nowRef) }
+    let r15 = try ClassReminder.make(session: soonSession, clubId: 39, clubName: "Canary Wharf", leadMinutes: 15, now: nowRef)
+    let r48h = try ClassReminder.make(session: row(9106, LondonCalendar.addDays(to: todayIso, days: 3)!, "10:00", "Future Ride"), clubId: 39, clubName: "Canary Wharf", leadMinutes: 2880, now: nowRef)
+    try assertTrue(r15.notificationTitle == "Quick Core in 15m" && r48h.notificationTitle == "Future Ride: 48h booking window open", "notification titles distinguish 48h open vs lead-time alerts")
+
+    // 3. Persistence, dedup, pruning, widget mirror exclusion, and survival across sign-in/sign-out/account switch
+    do {
+        let dir = ctx.scratch("rem-store"), mdir = ctx.scratch("rem-mirror")
+        try ctx.fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        try ctx.fm.createDirectory(at: mdir, withIntermediateDirectories: true)
+        let st = SharedStateStore(primaryDirectory: dir, mirrorDirectory: mdir), kc = ctx.keychain("rem-store"), widget = SharedStateStore(primaryDirectory: mdir)
+        let rA = try ClassReminder.make(session: laterSession, clubId: 39, clubName: "Canary Wharf", leadMinutes: 30, now: nowRef)
+        let rB = try ClassReminder.make(session: laterSession, clubId: 39, clubName: "Canary Wharf", leadMinutes: 60, now: nowRef)
+        let add1 = try st.addReminder(rA, now: nowRef)
+        let addDup = try st.addReminder(rA, now: nowRef)
+        let add2 = try st.addReminder(rB, now: nowRef)
+        try assertTrue(add1.added && !addDup.added && add2.reminders.map(\.leadMinutes) == [60, 30], "reminders deduplicate by id and sort earliest fire time first (\(add2.reminders.map(\.leadMinutes)))")
+        try loginSeed(st, memberA, kc, [])
+        _ = try st.clearSession(expectedSession: memberA, keychain: kc)
+        try assertTrue(st.loadReminders(now: nowRef).count == 2 && !ctx.fm.fileExists(atPath: mdir.appendingPathComponent("reminders.json").path) && widget.loadReminders(now: nowRef).isEmpty,
+                       "reminders survive sign-in/sign-out and stay in primary store only (never mirrored to widget)")
+        let after60 = clock(todayIso, "15:10")
+        try assertEqual(st.loadReminders(now: after60).map(\.leadMinutes), [30], "expired 60m reminder is pruned once its fire time passes")
+    }
+
+    // 4. Signed-out & signed-in ScheduleViewModel flows, custom inputs, scheduler permission banner, and zero private API calls
+    do {
+        let scheduler = MockReminderScheduler()
+        let dir = ctx.scratch("rem-vm"), kc = ctx.keychain("rem-vm"), mock = MobileMock()
+        try ctx.fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        let st = SharedStateStore(primaryDirectory: dir)
+        let futureDay = LondonCalendar.addDays(to: todayIso, days: 2)!
+        let futureRow = row(9110, futureDay, "14:00", "Barbell Club")
+        try st.seedSnapshot(clubSnapshot([todayIso: [laterSession], futureDay: [futureRow]]))
+        let vm = ScheduleViewModel(store: st, keychain: kc, client: mockPublicClient(store: st), bookingClient: mock.client, reminderScheduler: scheduler)
+        vm.nowOverride = nowRef
+        vm.selectedDate = todayIso
+        try assertTrue(vm.memberSession == nil && vm.canScheduleReminder(for: laterSession, now: nowRef), "signed-out user can schedule reminders")
+        await vm.togglePresetReminder(for: laterSession, leadMinutes: 30, now: nowRef)
+        vm.customReminderHours = "1"; vm.customReminderMinutes = "15"
+        await vm.addCustomReminder(for: laterSession, now: nowRef)
+        vm.customReminderHours = "0"; vm.customReminderMinutes = "2"
+        await vm.addCustomReminder(for: laterSession, now: nowRef)
+        try assertTrue(vm.bannerIsError && (vm.bannerMessage ?? "").contains("5m and 48h"), "invalid custom <5m surfaces banner error")
+        let boundaries = vm.upcomingBoundaryDates(now: nowRef)
+        let activeLabels = vm.reminders(for: laterSession, now: nowRef).map { ClassReminder.formatLeadTime(minutes: $0.leadMinutes) }
+        try assertTrue(activeLabels == ["30m", "1h 15m"] && boundaries.contains(clock(todayIso, "15:30")) && boundaries.contains(clock(todayIso, "14:45")),
+                       "menu redraw boundaries include reminder fire instants")
+        try loginSeed(st, memberA, kc, [])
+        vm.syncFromDisk()
+        try assertTrue(vm.memberSession == memberA && vm.upcomingReminders(now: nowRef).count == 2, "reminders persist seamlessly after signing in")
+        scheduler.status.value = .permissionDenied
+        await vm.togglePresetReminder(for: laterSession, leadMinutes: 60, now: nowRef)
+        try assertTrue(vm.bannerIsError && (vm.bannerMessage ?? "").contains("System Settings") && vm.reminders(for: laterSession, now: nowRef).count == 3,
+                       "denied notification permission still keeps local reminder and warns cleanly")
+        await vm.clearReminders(for: laterSession, now: nowRef)
+        try assertTrue(vm.reminders(for: laterSession, now: nowRef).isEmpty && mock.count == 0, "clearing reminders leaves zero private API calls")
+    }
+
+    // 5. Signed-out and signed-in CLI (`remind`, `reminders`, `unremind`) + MCP (`set_reminder`, `list_reminders`, `remove_reminder`)
+    do {
+        let scheduler = MockReminderScheduler(), dir = ctx.scratch("rem-cli"), kc = ctx.keychain("rem-cli"), mock = MobileMock()
+        try ctx.fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        let st = SharedStateStore(primaryDirectory: dir), pub = mockPublicClient(store: st)
+        let d3 = LondonCalendar.addDays(to: todayIso, days: 3)!
+        let sohoClub = Club(id: 52, name: "Soho", shortCode: "SOHO")
+        let r39 = row(9201, d3, "18:00", "Canary Ride"), r52 = ClassSession(id: 9201, date: d3, startTime: "19:00", endTime: "19:45", durationMinutes: 45, title: "Soho Lift", trainer: "", clubName: "Soho")
+        try st.seedSnapshot(clubSnapshot([d3: [r39]], clubId: 39))
+        try st.seedSnapshot(TimetableSnapshot(clubs: [canary, sohoClub], clubId: 52, clubName: "Soho", clubShortCode: "SOHO", days: [d3: [r52]], syncedAt: nowRef, daySyncedAt: [d3: nowRef]))
+        let cliNow: @Sendable () -> Date = { nowRef }
+
+        // Ambiguous class ID across signed-out clubs requires --club, succeeds once disambiguated
+        let ambigErr = await denialAsync { _ = try await TertiaCLI.setReminder(classId: 9201, clubId: nil, leadMinutes: 30, store: st, keychain: kc, client: pub, reminderScheduler: scheduler, nowProvider: cliNow) }
+        try assertTrue(ambigErr.contains("multiple cached clubs"), "unsigned user sees ambiguity prompt when two cached clubs share classId")
+        let setRes = try await TertiaCLI.setReminder(classId: 9201, clubId: 52, leadMinutes: 90, store: st, keychain: kc, client: pub, reminderScheduler: scheduler, nowProvider: cliNow)
+        try assertTrue(setRes.added && setRes.reminder.clubId == 52 && setRes.reminder.leadMinutes == 90, "unsigned setReminder succeeds with explicit clubId")
+
+        // Signed in user (`memberA` entitled to 39 and 200 only) sees class 9201 uniquely at club 39 via MCP
+        try loginSeed(st, memberA, kc, [])
+        func mcp(_ body: String) async -> String? {
+            await MCPServer.handleLine(body, store: st, keychain: kc, client: pub, bookingClient: mock.client, reminderScheduler: scheduler)
+        }
+        let badMCP = try errorCode(await mcp("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"set_reminder\",\"arguments\":{\"class_id\":\"9201\"}}}"))
+        try assertEqual(badMCP, -32602, "MCP set_reminder rejects non-integer class_id (-32602)")
+        let setMCP = try toolResult(await mcp("{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"set_reminder\",\"arguments\":{\"class_id\":9201,\"hours\":2,\"minutes\":15}}}"))
+        let listMCP = try toolResult(await mcp("{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"list_reminders\"}}"))
+        let isoDec = JSONDecoder(); isoDec.dateDecodingStrategy = .iso8601
+        let listed = try isoDec.decode([ClassReminder].self, from: Data(listMCP.text.utf8))
+        let remMCP = try toolResult(await mcp("{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\",\"params\":{\"name\":\"remove_reminder\",\"arguments\":{\"class_id\":9201,\"club_id\":39}}}"))
+        try assertTrue(!setMCP.isError && listed.map(\.clubId).sorted() == [39, 52] && remMCP.text.contains("Removed 1 reminder(s)") && mock.count == 0,
+                       "MCP set/list/remove reminders work cleanly with zero private API calls")
+
+        // CLI runner paths (tertia remind, tertia reminders --json, tertia unremind)
+        let cliAdd = try await captureOutput {
+            await TertiaCLI.run(args: ["remind", "9201", "--before", "45m", "--club", "52"], store: st, keychain: kc, client: pub, bookingClient: mock.client, reminderScheduler: scheduler)
+        }
+        let cliList = try await captureOutput {
+            await TertiaCLI.run(args: ["reminders", "--json"], store: st, keychain: kc, client: pub, bookingClient: mock.client, reminderScheduler: scheduler)
+        }
+        let cliListItems = try isoDec.decode([ClassReminder].self, from: Data(cliList.out.utf8))
+        let cliDel = try await captureOutput {
+            await TertiaCLI.run(args: ["unremind", "9201", "--club", "52"], store: st, keychain: kc, client: pub, bookingClient: mock.client, reminderScheduler: scheduler)
+        }
+        try assertTrue(cliAdd.code == 0 && cliAdd.out.contains("45m before")
+                       && cliList.code == 0 && cliListItems.map(\.leadMinutes).sorted() == [45, 90]
+                       && cliDel.code == 0 && cliDel.out.contains("Removed 2 reminder(s)"),
+                       "CLI remind, reminders --json, and unremind work end-to-end")
+
+        // Bundled CLI usage text includes reminder commands without touching user AppSupport
+        let rawBin = ProcessInfo.processInfo.environment["TERTIA_APP_BIN"].flatMap { $0.isEmpty ? nil : $0 } ?? "dist/Tertia.app/Contents/MacOS/Tertia"
+        let bin = URL(fileURLWithPath: rawBin, relativeTo: URL(fileURLWithPath: ctx.fm.currentDirectoryPath)).standardizedFileURL.path
+        let symDir = ctx.scratch("rem-bin"); try ctx.fm.createDirectory(at: symDir, withIntermediateDirectories: true)
+        let sym = symDir.appendingPathComponent("tertia"); try ctx.fm.createSymbolicLink(atPath: sym.path, withDestinationPath: bin)
+        let help = try runSubprocess(sym.path, args: ["remind", "--help"])
+        try assertTrue(help.status == 0 && help.stdout.contains("tertia remind") && help.stdout.contains("tertia reminders"), "bundled tertia CLI documents reminder subcommands")
     }
 }

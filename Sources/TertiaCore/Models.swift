@@ -374,6 +374,7 @@ public enum LondonCalendar {
 
     public static func londonTodayIso(now: Date = Date()) -> String { formatter("yyyy-MM-dd").string(from: now) }
     public static func formatSyncTime(_ date: Date) -> String { formatter("HH:mm").string(from: date) }
+    public static func formatWeekdayTime(_ date: Date) -> String { formatter("EEE HH:mm").string(from: date) }
 
     public static func addDays(to dateIso: String, days: Int) -> String? {
         guard let parsed = parseIsoDate(dateIso),
@@ -492,14 +493,14 @@ public enum LondonCalendar {
     }
 
     /// `now` followed by every later instant where a row's badge or visibility changes: opening-soon (60h), 48h open,
-    /// class start, each active booking's own start (`activeBookingStarts`), and the next London midnight. Drives idle
-    /// menu redraws with zero network requests.
-    public static func upcomingBoundaryDates(for sessions: [ClassSession], now: Date = Date(), activeBookingStarts: [Int: Date] = [:]) -> [Date] {
+    /// class start, each active booking's own start (`activeBookingStarts`), any `additionalDates` (such as reminder
+    /// fire instants), and the next London midnight. Drives idle menu redraws with zero network requests.
+    public static func upcomingBoundaryDates(for sessions: [ClassSession], now: Date = Date(), activeBookingStarts: [Int: Date] = [:], additionalDates: [Date] = []) -> [Date] {
         let marks = sessions.compactMap(startDate(of:)).flatMap { start in
             [-60.0, -48, 0].map { start.addingTimeInterval($0 * 3600) }
         }
         let bookedMarks = sessions.compactMap { activeBookingStarts[$0.id] }
-        return [now] + Set(marks + bookedMarks + [nextMidnight(after: now)].compactMap { $0 }).filter { $0 > now }.sorted()
+        return [now] + Set(marks + bookedMarks + additionalDates + [nextMidnight(after: now)].compactMap { $0 }).filter { $0 > now }.sorted()
     }
 
     /// Rows that pass the date, period, and search filters. A row with an entry in `activeBookingStarts` (an active

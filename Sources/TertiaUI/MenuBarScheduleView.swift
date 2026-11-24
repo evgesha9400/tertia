@@ -14,6 +14,11 @@ public final class ScheduleViewModel: ObservableObject {
     @Published public var themeOverride: ColorScheme? = .dark
     @Published public var isClubMenuOpen = false
     @Published public var isAccountOpen = false
+    @Published public var isRemindersOpen = false
+    @Published public var reminders: [ClassReminder] = []
+    @Published public var openReminderClassKey: String?
+    @Published public var customReminderHours = "0"
+    @Published public var customReminderMinutes = "30"
     @Published public var emailInput = ""
     @Published public var passwordInput = ""
     @Published public var isAuthBusy = false
@@ -32,6 +37,7 @@ public final class ScheduleViewModel: ObservableObject {
     private let bookingClient: MobileBookingClient
     private let store: SharedStateStore
     private let keychain: KeychainStore
+    private let reminderScheduler: (any ReminderScheduler)?
     private let onStateChanged: (@Sendable () -> Void)?
     /// Bumped by every `load`; only the newest load may write `snapshot`, `errorMessage`, or `isLoading`.
     private var loadGeneration: UInt64 = 0
@@ -55,11 +61,13 @@ public final class ScheduleViewModel: ObservableObject {
     /// Widget-copy failure of the last club realignment; `signIn` reports it instead of a plain success banner.
     private var alignmentMirrorError: Error?
 
-    public init(store: SharedStateStore = SharedStateStore(), keychain: KeychainStore = KeychainStore(), client: PublicTimetableClient? = nil, bookingClient: MobileBookingClient = MobileBookingClient(), onStateChanged: (@Sendable () -> Void)? = nil) {
+    public init(store: SharedStateStore = SharedStateStore(), keychain: KeychainStore = KeychainStore(), client: PublicTimetableClient? = nil,
+                bookingClient: MobileBookingClient = MobileBookingClient(), reminderScheduler: (any ReminderScheduler)? = nil, onStateChanged: (@Sendable () -> Void)? = nil) {
         self.store = store
         self.keychain = keychain
         self.client = client ?? PublicTimetableClient(store: store)
         self.bookingClient = bookingClient
+        self.reminderScheduler = reminderScheduler
         self.onStateChanged = onStateChanged
         reloadLocalState(autoLoad: false)
     }
@@ -101,6 +109,7 @@ public final class ScheduleViewModel: ObservableObject {
     private func reloadLocalState(autoLoad: Bool = true) {
         let todayIso = LondonCalendar.londonTodayIso()
         if selectedDate < todayIso { selectedDate = todayIso }
+        reminders = store.loadReminders(now: nowOverride ?? Date())
         let previousClubId = preferences.clubId
         let result = Result { try store.alignPreferencesToCurrentAccount(keychain: keychain) }
         let state = try? result.get()
@@ -202,10 +211,11 @@ public final class ScheduleViewModel: ObservableObject {
                                              now: now, activeBookingStarts: matchedStarts(rows, index: index))
     }
 
-    /// Redraw instants of the shown date (`LondonCalendar.upcomingBoundaryDates` with the row-matched booking starts).
+    /// Redraw instants of the shown date (`LondonCalendar.upcomingBoundaryDates` with the row-matched booking starts and
+    /// active reminder fire instants).
     public func upcomingBoundaryDates(index: SharedStateStore.EntitledTimetableIndex? = nil, now: Date = Date()) -> [Date] {
         let rows = snapshot?.classes(for: effectiveSelectedDate(now: now)) ?? []
-        return LondonCalendar.upcomingBoundaryDates(for: rows, now: now, activeBookingStarts: matchedStarts(rows, index: index))
+        return LondonCalendar.upcomingBoundaryDates(for: rows, now: now, activeBookingStarts: matchedStarts(rows, index: index), additionalDates: reminders.map(\.fireAt))
     }
 
     /// What a class card shows for `session`: whether this row is the booked class (`matchesDisplayedRow`, so a same-ID
@@ -605,11 +615,132 @@ public final class ScheduleViewModel: ObservableObject {
     public var isDaySwitchLocked: Bool { isAccountBusy }
 
     public func selectDate(_ dateIso: String) {
-        isClubMenuOpen = false; clearLateConfirm(); selectedDate = dateIso
+        isClubMenuOpen = false; openReminderClassKey = nil; clearLateConfirm(); selectedDate = dateIso
         Task { await load(forceRefresh: false) }
     }
 
     public func toggleTheme() { themeOverride = (themeOverride == .light) ? .dark : .light }
+
+    // MARK: Reminders
+
+    public func reminders(for session: ClassSession, now: Date = Date()) -> [ClassReminder] {
+        let key = ClassReminder.classKey(clubId: preferences.clubId, date: session.date, classId: session.id)
+        return reminders.filter { $0.classKey == key && $0.fireAt > now }.sorted { $0.leadMinutes < $1.leadMinutes }
+    }
+
+    public func upcomingReminders(now: Date = Date()) -> [ClassReminder] {
+        reminders.filter { $0.fireAt > now }
+    }
+
+    public func isReminderPickerOpen(for session: ClassSession) -> Bool {
+        openReminderClassKey == ClassReminder.classKey(clubId: preferences.clubId, date: session.date, classId: session.id)
+    }
+
+    public func canScheduleReminder(for session: ClassSession, now: Date = Date()) -> Bool {
+        guard case .exact(let start) = LondonCalendar.resolveLondonWallTime(dateIso: session.date, hhmm: session.startTime) else { return false }
+        return start.timeIntervalSince(now) > TimeInterval(ClassReminder.minLeadMinutes * 60)
+    }
+
+    public func toggleReminderPicker(for session: ClassSession) {
+        let key = ClassReminder.classKey(clubId: preferences.clubId, date: session.date, classId: session.id)
+        openReminderClassKey = (openReminderClassKey == key) ? nil : key
+        customReminderHours = "0"; customReminderMinutes = "30"
+    }
+
+    public func togglePresetReminder(for session: ClassSession, leadMinutes: Int, now: Date? = nil) async {
+        let clock = now ?? nowOverride ?? Date()
+        if let existing = reminders(for: session, now: clock).first(where: { $0.leadMinutes == leadMinutes }) {
+            await removeReminder(id: existing.id, now: clock)
+            return
+        }
+        await saveNewReminder(session: session, leadMinutes: leadMinutes, now: clock)
+    }
+
+    public func addCustomReminder(for session: ClassSession, now: Date? = nil) async {
+        let clock = now ?? nowOverride ?? Date()
+        do {
+            let lead = try ClassReminder.leadMinutes(hoursText: customReminderHours, minutesText: customReminderMinutes)
+            await saveNewReminder(session: session, leadMinutes: lead, now: clock)
+        } catch {
+            showBanner(error.localizedDescription, isError: true)
+        }
+    }
+
+    private func saveNewReminder(session: ClassSession, leadMinutes: Int, now: Date) async {
+        do {
+            let reminder = try ClassReminder.make(session: session, clubId: preferences.clubId, clubName: preferences.clubName, leadMinutes: leadMinutes, now: now)
+            let saved = try store.addReminder(reminder, now: now)
+            reminders = saved.reminders
+            onStateChanged?()
+            await reconcileReminders(requestPermission: true, now: now, announceAdded: reminder)
+        } catch {
+            showBanner(error.localizedDescription, isError: true)
+        }
+    }
+
+    public func removeReminder(id: String, now: Date? = nil) async {
+        let clock = now ?? nowOverride ?? Date()
+        do {
+            reminders = try store.removeReminder(id: id, now: clock).reminders
+            onStateChanged?()
+            await reconcileReminders(requestPermission: false, now: clock)
+        } catch {
+            showBanner("Could not remove reminder: \(error.localizedDescription)", isError: true)
+        }
+    }
+
+    public func clearReminders(for session: ClassSession, now: Date? = nil) async {
+        let clock = now ?? nowOverride ?? Date()
+        do {
+            reminders = try store.removeReminders(classId: session.id, clubId: preferences.clubId, date: session.date, now: clock).reminders
+            onStateChanged?()
+            await reconcileReminders(requestPermission: false, now: clock)
+        } catch {
+            showBanner("Could not clear reminders: \(error.localizedDescription)", isError: true)
+        }
+    }
+
+    public func reconcileReminders(requestPermission: Bool, now: Date? = nil) async {
+        await reconcileReminders(requestPermission: requestPermission, now: now, announceAdded: nil)
+    }
+
+    private func reconcileReminders(requestPermission: Bool, now: Date? = nil, announceAdded: ClassReminder? = nil) async {
+        let clock = now ?? nowOverride ?? Date()
+        if let pruned = try? store.pruneExpiredReminders(now: clock) { reminders = pruned }
+        guard let reminderScheduler else {
+            if let r = announceAdded { showBanner("Reminder set: \(r.title) (\(ClassReminder.formatLeadTime(minutes: r.leadMinutes)) before).", isError: false) }
+            return
+        }
+        let status = await reminderScheduler.sync(reminders: reminders, requestPermission: requestPermission, now: clock)
+        switch status {
+        case .scheduled:
+            if let r = announceAdded { showBanner("Reminder set: \(r.title) (\(ClassReminder.formatLeadTime(minutes: r.leadMinutes)) before).", isError: false) }
+        case .permissionDenied where requestPermission:
+            showBanner("Reminder saved locally. Enable Notifications for Tertia in System Settings.", isError: true)
+        case .permissionPending where requestPermission:
+            showBanner("Reminder saved locally. Approve Notifications for Tertia to receive alerts.", isError: true)
+        case .unavailable(let reason) where announceAdded != nil:
+            showBanner("Reminder saved locally (\(reason)).", isError: false)
+        default:
+            break
+        }
+    }
+
+    public func openReminderTarget(clubId: Int, date: String) {
+        isRemindersOpen = false
+        guard let club = availableClubs.first(where: { $0.id == clubId }) else {
+            showBanner("Switch accounts or sign out to view club \(clubId).", isError: true)
+            return
+        }
+        openReminderClassKey = nil
+        clearLateConfirm()
+        selectedDate = max(date, LondonCalendar.londonTodayIso(now: nowOverride ?? Date()))
+        if preferences.clubId != club.id {
+            selectClub(club)
+        } else {
+            Task { await load(forceRefresh: false) }
+        }
+    }
 
     /// Persists through the cross-process `updatePreferences` first and adopts the committed result; a failed save keeps
     /// the current preferences, skips `onStateChanged`, and shows an error, while a failed widget-mirror write keeps the
@@ -632,7 +763,7 @@ public final class ScheduleViewModel: ObservableObject {
         if preferences.clubId != previousClubId {
             invalidateLoads()
             snapshot = store.loadSnapshot(clubId: preferences.clubId)
-            errorMessage = nil; clearLateConfirm()
+            errorMessage = nil; openReminderClassKey = nil; clearLateConfirm()
             Task { await load(forceRefresh: false) }
         }
         onStateChanged?()
@@ -841,10 +972,11 @@ public struct MenuBarScheduleView: View {
     private func headerBar(palette: TertiaPalette, activeScheme: ColorScheme) -> some View {
         HStack {
             TertiaWordmarkView(palette: palette, compact: false)
+                .fixedSize(horizontal: true, vertical: false)
             Spacer()
             HStack(spacing: 4) {
                 Button {
-                    withAnimation(.easeOut(duration: 0.14)) { model.isAccountOpen.toggle(); model.isClubMenuOpen = false }
+                    withAnimation(.easeOut(duration: 0.14)) { model.isAccountOpen.toggle(); model.isRemindersOpen = false; model.isClubMenuOpen = false }
                 } label: {
                     HStack(spacing: 5) {
                         if model.memberSession != nil { Circle().fill(palette.openStatus).frame(width: 6, height: 6) }
@@ -854,7 +986,7 @@ public struct MenuBarScheduleView: View {
                     .padding(.horizontal, 8).frame(height: 26)
                     .tertiaSurface(fill: palette.pillSurface, border: model.isAccountOpen ? palette.border : .clear, radius: 7)
                 }
-                .buttonStyle(.plain).help("Member account")
+                .buttonStyle(.plain).help("Member account").layoutPriority(1)
 
                 iconButton("arrow.clockwise", help: "Refresh schedule and bookings", palette: palette) { Task { await model.load(forceRefresh: true) } }
                     .disabled(model.isLoading).opacity(model.isLoading ? 0.45 : 1.0)
@@ -937,23 +1069,51 @@ public struct MenuBarScheduleView: View {
     }
 
     private func controlsSection(palette: TertiaPalette, now: Date) -> some View {
-        VStack(alignment: .leading, spacing: 9) {
+        let reminderCount = model.upcomingReminders(now: now).count
+        return VStack(alignment: .leading, spacing: 9) {
             HStack {
                 Text("Timetable").font(.system(size: 17, weight: .regular, design: .serif)).foregroundStyle(palette.ink)
                 Spacer()
-                Button {
-                    withAnimation(.easeOut(duration: 0.14)) { model.isAccountOpen = false; model.isClubMenuOpen.toggle() }
-                } label: {
-                    HStack(spacing: 6) {
-                        Text(model.preferences.clubName).font(.system(size: 11.5, weight: .medium)).lineLimit(1)
-                        Image(systemName: "chevron.down").font(.system(size: 9, weight: .semibold))
-                            .rotationEffect(.degrees(model.isClubMenuOpen ? 180 : 0)).foregroundStyle(palette.muted)
+                HStack(spacing: 6) {
+                    Button {
+                        withAnimation(.easeOut(duration: 0.14)) { model.isRemindersOpen.toggle(); model.isAccountOpen = false; model.isClubMenuOpen = false }
+                    } label: {
+                        HStack(spacing: 4) {
+                            Image(systemName: reminderCount > 0 || model.isRemindersOpen ? "bell.fill" : "bell")
+                                .font(.system(size: 10.5, weight: .medium))
+                            if reminderCount > 0 {
+                                Text("\(reminderCount)").font(.system(size: 10, weight: .semibold, design: .monospaced)).monospacedDigit()
+                            }
+                        }
+                        .foregroundStyle(model.isRemindersOpen ? palette.ink : (reminderCount > 0 ? palette.warningStatus : palette.muted))
+                        .padding(.horizontal, reminderCount > 0 ? 8 : 7).padding(.vertical, 5)
+                        .tertiaSurface(
+                            fill: reminderCount > 0 ? palette.warningStatus.opacity(0.12) : palette.pillSurface,
+                            border: model.isRemindersOpen ? palette.ink.opacity(0.35) : (reminderCount > 0 ? palette.warningStatus.opacity(0.4) : palette.border),
+                            radius: TertiaMetrics.pillRadius
+                        )
+                        .contentShape(RoundedRectangle(cornerRadius: TertiaMetrics.pillRadius, style: .continuous))
                     }
-                    .foregroundStyle(palette.ink).padding(.horizontal, 10).padding(.vertical, 5)
-                    .tertiaSurface(fill: palette.pillSurface, border: model.isClubMenuOpen ? palette.ink.opacity(0.35) : palette.border, radius: TertiaMetrics.pillRadius)
-                    .contentShape(RoundedRectangle(cornerRadius: TertiaMetrics.pillRadius, style: .continuous))
+                    .buttonStyle(.plain).help("Class reminders")
+
+                    Button {
+                        withAnimation(.easeOut(duration: 0.14)) { model.isAccountOpen = false; model.isRemindersOpen = false; model.isClubMenuOpen.toggle() }
+                    } label: {
+                        HStack(spacing: 6) {
+                            Text(model.preferences.clubName).font(.system(size: 11.5, weight: .medium)).lineLimit(1)
+                            Image(systemName: "chevron.down").font(.system(size: 9, weight: .semibold))
+                                .rotationEffect(.degrees(model.isClubMenuOpen ? 180 : 0)).foregroundStyle(palette.muted)
+                        }
+                        .foregroundStyle(palette.ink).padding(.horizontal, 10).padding(.vertical, 5)
+                        .tertiaSurface(fill: palette.pillSurface, border: model.isClubMenuOpen ? palette.ink.opacity(0.35) : palette.border, radius: TertiaMetrics.pillRadius)
+                        .contentShape(RoundedRectangle(cornerRadius: TertiaMetrics.pillRadius, style: .continuous))
+                    }
+                    .buttonStyle(.plain)
                 }
-                .buttonStyle(.plain)
+            }
+
+            if model.isRemindersOpen {
+                RemindersOverviewPanel(model: model, palette: palette, now: now)
             }
 
             PreviewableScroll(axis: .horizontal, frozen: staticPreview) {
@@ -1054,15 +1214,27 @@ public struct MenuBarScheduleView: View {
     /// The button captures what it shows (book, cancel, or the late confirmation), the session token, and the club, so a
     /// click is refused if any of them changed. Cancel eligibility follows `BookingAuthorization.canCancel`, the same
     /// rule the action runs.
+    @ViewBuilder
     private func classCard(session: ClassSession, index: SharedStateStore.EntitledTimetableIndex?, palette: TertiaPalette, now: Date) -> some View {
         let inputs = model.cardInputs(for: session, index: index, now: now)
         let action = model.classAction(for: session, index: index, inputs: inputs, now: now)
-        return CompactClassCard(
-            session: session, palette: palette, now: now, dense: false,
-            isBooked: inputs.isBooked, isBusy: model.busyClassId == session.id,
-            confirmingLateCancel: model.isConfirmingLateCancel(session.id), canCancelBooked: inputs.canCancelBooked,
-            onAction: action.map { action in { () -> Void in _ = Task { await action() } } }
-        )
+        let classReminders = model.reminders(for: session, now: now)
+        let pickerOpen = model.isReminderPickerOpen(for: session)
+        let showBell = !classReminders.isEmpty || model.canScheduleReminder(for: session, now: now)
+        VStack(spacing: 4) {
+            CompactClassCard(
+                session: session, palette: palette, now: now, dense: false,
+                isBooked: inputs.isBooked, isBusy: model.busyClassId == session.id,
+                confirmingLateCancel: model.isConfirmingLateCancel(session.id), canCancelBooked: inputs.canCancelBooked,
+                activeReminderLabels: classReminders.map { ClassReminder.formatLeadTime(minutes: $0.leadMinutes) },
+                isReminderPickerOpen: pickerOpen,
+                onToggleReminderPicker: showBell ? { withAnimation(.easeOut(duration: 0.12)) { model.toggleReminderPicker(for: session) } } : nil,
+                onAction: action.map { action in { () -> Void in _ = Task { await action() } } }
+            )
+            if pickerOpen {
+                ClassReminderDrawer(model: model, session: session, palette: palette, now: now, staticPreview: staticPreview)
+            }
+        }
     }
 
     private func footerBar(count: Int, palette: TertiaPalette, now: Date) -> some View {
